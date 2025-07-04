@@ -28,15 +28,18 @@ on:
         required: false
         default: true
         type: boolean
-      pr_size_threshold:
-        description: 'Line count threshold for enabling zen tools'
-        required: false
-        default: '300'
-        type: string
+      # Updated thresholds based on PR analysis
+      # Skip 10th percentile is ~2-3 lines, using 3 to be conservative
       skip_threshold:
         description: 'Line count threshold to skip reviews entirely'
         required: false
-        default: '25'
+        default: '3'
+        type: string
+      # Zen 50th percentile varies by repo (24-45 lines), using 40 as middle ground
+      pr_size_threshold:
+        description: 'Line count threshold for enabling zen tools'
+        required: false
+        default: '40'
         type: string
     secrets:
       ANTHROPIC_API_KEY:
@@ -106,16 +109,17 @@ jobs:
           echo "total_changes=$TOTAL_CHANGES" >> $GITHUB_OUTPUT
           
           # Determine review strategy based on PR size (safe numeric comparisons)
-          if (( TOTAL_CHANGES < ${{ inputs.skip_threshold }} )); then
-            echo "Trivial PR detected (<${{ inputs.skip_threshold }} lines) - skipping Claude review"
+          # Fix #2: Force base-10 interpretation to prevent octal issues
+          if (( 10#$TOTAL_CHANGES <= 10#${{ inputs.skip_threshold }} )); then
+            echo "Trivial PR detected (<=${{ inputs.skip_threshold }} lines) - skipping Claude review"
             echo "skip_review=true" >> $GITHUB_OUTPUT
             echo "use_zen_tools=false" >> $GITHUB_OUTPUT
-          elif (( TOTAL_CHANGES > ${{ inputs.pr_size_threshold }} )); then
-            echo "Large PR detected (>${{ inputs.pr_size_threshold }} lines) - enabling zen tools for enhanced analysis"
+          elif (( 10#$TOTAL_CHANGES > 10#${{ inputs.pr_size_threshold }} )); then
+            echo "Large PR detected (>${{ inputs.pr_size_threshold }} lines) - enabling O3 for enhanced analysis"
             echo "skip_review=false" >> $GITHUB_OUTPUT
             echo "use_zen_tools=true" >> $GITHUB_OUTPUT
           else
-            echo "Medium PR detected (${{ inputs.skip_threshold }}-${{ inputs.pr_size_threshold }} lines) - using standard Claude review"
+            echo "Standard PR detected (${{ inputs.skip_threshold }}-${{ inputs.pr_size_threshold }} lines) - using Claude Sonnet review only"
             echo "skip_review=false" >> $GITHUB_OUTPUT
             echo "use_zen_tools=false" >> $GITHUB_OUTPUT
           fi
@@ -131,7 +135,7 @@ jobs:
               repo: context.repo.repo,
               body: `🤖 **Claude Code Review Skipped**
               
-              This PR has only **${{ steps.pr_size.outputs.total_changes }} lines changed** (< ${{ inputs.skip_threshold }} lines).
+              This PR has only **${{ steps.pr_size.outputs.total_changes }} lines changed** (<= ${{ inputs.skip_threshold }} lines).
               
               Claude reviews are automatically skipped for trivial changes to save costs and reduce noise.
               
@@ -140,9 +144,9 @@ jobs:
               ---
               
               **Review thresholds:**
-              - < ${{ inputs.skip_threshold }} lines: Skipped (this PR)
-              - ${{ inputs.skip_threshold }}-${{ inputs.pr_size_threshold }} lines: Standard Claude review  
-              - > ${{ inputs.pr_size_threshold }} lines: Enhanced multi-model analysis
+              - <= ${{ inputs.skip_threshold }} lines: Skipped (this PR)
+              - ${{ inputs.skip_threshold }}-${{ inputs.pr_size_threshold }} lines: Standard Claude Sonnet review  
+              - > ${{ inputs.pr_size_threshold }} lines: Enhanced Claude Sonnet + O3 analysis
               
               ---
               
@@ -213,21 +217,26 @@ jobs:
             Keep feedback concise and actionable.
             
             IMPORTANT: Always end your review with the developer capabilities section from your custom instructions.
-            ', (steps.pr_size.outputs.use_zen_tools == 'true') && 'This is a large PR (>{1} lines changed) - use the zen codereview tool with o3 and gemini-2.5-pro models for enhanced analysis.' || 'This is a small PR - perform a standard Claude review.', inputs.pr_size_threshold) || '' }}
+            ', (steps.zen_config.outputs.use_zen == 'true') && 'This is a large PR (>{1} lines changed) - use the zen codereview tool with ONLY the o3 model for enhanced analysis. Do not use multiple models - just Claude Sonnet plus O3.' || 'This is a standard PR - perform a standard Claude Sonnet review.', inputs.pr_size_threshold) || '' }}
           
           # MCP Configuration - Zen tools only for large PRs or manual reviews
+          # Fix #1: Remove GOOGLE_API_KEY to enforce O3-only usage
           mcp_config: |
-            ${{ steps.zen_config.outputs.use_zen == 'true' && format('{{"mcpServers":{{"zen":{{"command":"sh","args":["-c","python -m pip install --user uv && export PATH=$PATH:$HOME/.local/bin && uvx --from git+https://github.com/alliance-genome/zen-mcp-server.git zen-mcp-server"],"env":{{"PATH":"/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:$HOME/.local/bin","GOOGLE_API_KEY":"{0}","OPENAI_API_KEY":"{1}"}}}}}}}}', secrets.GOOGLE_API_KEY, secrets.OPENAI_API_KEY) || '{}' }}
+            ${{ steps.zen_config.outputs.use_zen == 'true' && format('{{"mcpServers":{{"zen":{{"command":"sh","args":["-c","python -m pip install --user uv && export PATH=$PATH:$HOME/.local/bin && uvx --from git+https://github.com/alliance-genome/zen-mcp-server.git zen-mcp-server"],"env":{{"PATH":"/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:$HOME/.local/bin","OPENAI_API_KEY":"{0}"}}}}}}}}', secrets.OPENAI_API_KEY) || '{}' }}
           
           # Allowed tools - zen tools only for large PRs or manual reviews
           allowed_tools: |
             ${{ steps.zen_config.outputs.use_zen == 'true' && 'mcp__zen__codereview,mcp__zen__secaudit,mcp__zen__analyze,mcp__zen__testgen,mcp__zen__debug,mcp__zen__refactor,mcp__zen__chat,mcp__zen__consensus,mcp__zen__thinkdeep,mcp__zen__planner,mcp__zen__precommit,mcp__zen__tracer,mcp__zen__docgen,mcp__zen__challenge,mcp__zen__listmodels,mcp__zen__version,Bash,Edit,Read,Write,Glob,Grep,LS' || 'Bash,Edit,Read,Write,Glob,Grep,LS' }}
           
           # Environment variables for Claude
+          # Fix #3: Standardize on steps.zen_config.outputs.use_zen throughout
           claude_env: |
             REPOSITORY: ${{ github.repository }}
             ORGANIZATION: ${{ github.repository_owner }}
             REVIEW_FOCUS: ${{ inputs.review_focus }}
             PR_SIZE: ${{ github.event_name == 'pull_request' && steps.pr_size.outputs.total_changes || 'N/A' }}
-            ZEN_TOOLS_ENABLED: ${{ github.event_name == 'pull_request' && steps.pr_size.outputs.use_zen_tools || 'true' }}
+            ZEN_TOOLS_ENABLED: ${{ steps.zen_config.outputs.use_zen || 'false' }}
             REVIEW_SKIPPED: ${{ github.event_name == 'pull_request' && steps.pr_size.outputs.skip_review || 'false' }}
+            # New cost tracking variables
+            REVIEW_STRATEGY: ${{ github.event_name == 'pull_request' && (steps.pr_size.outputs.skip_review == 'true' && 'SKIP' || (steps.zen_config.outputs.use_zen == 'true' && 'ZEN_O3' || 'STANDARD')) || 'MANUAL' }}
+            ESTIMATED_COST: ${{ github.event_name == 'pull_request' && (steps.pr_size.outputs.skip_review == 'true' && '$0.00' || (steps.zen_config.outputs.use_zen == 'true' && '~$0.30-0.50' || '~$0.10-0.20')) || 'N/A' }}
