@@ -143,10 +143,10 @@ jobs:
               
               ---
               
-              **Review thresholds:**
-              - <= ${{ inputs.skip_threshold }} lines: Skipped (this PR)
-              - ${{ inputs.skip_threshold }}-${{ inputs.pr_size_threshold }} lines: Standard Claude Sonnet review  
-              - > ${{ inputs.pr_size_threshold }} lines: Enhanced Claude Sonnet + O3 analysis
+              **Review strategy (current thresholds):**
+              - **Bottom 10%** (≤ ${{ inputs.skip_threshold }} lines): Skipped - this PR
+              - **Middle 40%** (${{ inputs.skip_threshold }}-${{ inputs.pr_size_threshold }} lines): Standard Claude Sonnet review  
+              - **Top 50%** (> ${{ inputs.pr_size_threshold }} lines): Enhanced Claude Sonnet + O3 analysis
               
               ---
               
