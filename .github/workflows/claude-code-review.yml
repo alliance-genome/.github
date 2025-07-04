@@ -217,22 +217,7 @@ jobs:
           
           # MCP Configuration - Zen tools only for large PRs or manual reviews
           mcp_config: |
-            ${{ steps.zen_config.outputs.use_zen == 'true' && format('{
-              "mcpServers": {
-                "zen": {
-                  "command": "sh",
-                  "args": [
-                    "-c", 
-                    "python -m pip install --user uv && export PATH=$PATH:$HOME/.local/bin && uvx --from git+https://github.com/alliance-genome/zen-mcp-server.git zen-mcp-server"
-                  ],
-                  "env": {
-                    "PATH": "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:$HOME/.local/bin",
-                    "GOOGLE_API_KEY": "{0}",
-                    "OPENAI_API_KEY": "{1}"
-                  }
-                }
-              }
-            }', secrets.GOOGLE_API_KEY, secrets.OPENAI_API_KEY) || '{}' }}
+            ${{ steps.zen_config.outputs.use_zen == 'true' && format('{{"mcpServers":{{"zen":{{"command":"sh","args":["-c","python -m pip install --user uv && export PATH=$PATH:$HOME/.local/bin && uvx --from git+https://github.com/alliance-genome/zen-mcp-server.git zen-mcp-server"],"env":{{"PATH":"/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:$HOME/.local/bin","GOOGLE_API_KEY":"{0}","OPENAI_API_KEY":"{1}"}}}}}}}}', secrets.GOOGLE_API_KEY, secrets.OPENAI_API_KEY) || '{}' }}
           
           # Allowed tools - zen tools only for large PRs or manual reviews
           allowed_tools: |
