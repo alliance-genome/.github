@@ -53,7 +53,6 @@ jobs:
   claude-review:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
       contents: read
       pull-requests: write
       issues: write
@@ -72,12 +71,24 @@ jobs:
         id: pr_size
         if: github.event_name == 'pull_request'
         run: |
+          set -eo pipefail
+          
+          # Validate inputs are integers
+          if ! [[ "${{ inputs.skip_threshold }}" =~ ^[0-9]+$ ]]; then
+            echo "Error: skip_threshold must be an integer"
+            exit 1
+          fi
+          if ! [[ "${{ inputs.pr_size_threshold }}" =~ ^[0-9]+$ ]]; then
+            echo "Error: pr_size_threshold must be an integer"
+            exit 1
+          fi
+          
           # Get the base and head commits
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
           
-          # Calculate lines added and removed
-          DIFF_STATS=$(git diff --numstat $BASE_SHA..$HEAD_SHA)
+          # Calculate lines added and removed (filter out binary files)
+          DIFF_STATS=$(git diff --numstat $BASE_SHA..$HEAD_SHA | grep -E '^[0-9]+\s+[0-9]+' || true)
           TOTAL_CHANGES=$(echo "$DIFF_STATS" | awk '{added+=$1; removed+=$2} END {print added+removed}')
           
           # Handle empty or malformed output - ensure it's a valid number
@@ -92,11 +103,11 @@ jobs:
           echo "total_changes=$TOTAL_CHANGES" >> $GITHUB_OUTPUT
           
           # Determine review strategy based on PR size (safe numeric comparisons)
-          if [ "${TOTAL_CHANGES:-0}" -lt ${{ inputs.skip_threshold }} ]; then
+          if (( TOTAL_CHANGES < ${{ inputs.skip_threshold }} )); then
             echo "Trivial PR detected (<${{ inputs.skip_threshold }} lines) - skipping Claude review"
             echo "skip_review=true" >> $GITHUB_OUTPUT
             echo "use_zen_tools=false" >> $GITHUB_OUTPUT
-          elif [ "${TOTAL_CHANGES:-0}" -gt ${{ inputs.pr_size_threshold }} ]; then
+          elif (( TOTAL_CHANGES > ${{ inputs.pr_size_threshold }} )); then
             echo "Large PR detected (>${{ inputs.pr_size_threshold }} lines) - enabling zen tools for enhanced analysis"
             echo "skip_review=false" >> $GITHUB_OUTPUT
             echo "use_zen_tools=true" >> $GITHUB_OUTPUT
@@ -142,6 +153,19 @@ jobs:
               
               Just comment \`${{ inputs.trigger_phrase }}\` followed by your request!`
             })
+            
+      - name: Determine zen tools configuration
+        id: zen_config
+        if: github.event_name != 'pull_request' || steps.pr_size.outputs.skip_review != 'true'
+        run: |
+          # Determine if zen tools should be enabled
+          USE_ZEN="false"
+          if [[ "${{ github.event_name }}" != "pull_request" ]] || [[ "${{ steps.pr_size.outputs.use_zen_tools }}" == "true" ]]; then
+            if [[ "${{ inputs.use_zen_tools }}" == "true" ]]; then
+              USE_ZEN="true"
+            fi
+          fi
+          echo "use_zen=$USE_ZEN" >> $GITHUB_OUTPUT
         
       - name: Setup Claude Code Review
         uses: anthropics/claude-code-action@beta
@@ -190,13 +214,13 @@ jobs:
           
           # MCP Configuration - Zen tools only for large PRs or manual reviews
           mcp_config: |
-            ${{ (github.event_name != 'pull_request' || steps.pr_size.outputs.use_zen_tools == 'true') && inputs.use_zen_tools && format('{
+            ${{ steps.zen_config.outputs.use_zen == 'true' && format('{
               "mcpServers": {
                 "zen": {
                   "command": "sh",
                   "args": [
                     "-c", 
-                    "python -m pip install --user uv && export PATH=$PATH:$HOME/.local/bin && uvx --from git+https://github.com/BeehiveInnovations/zen-mcp-server.git zen-mcp-server"
+                    "python -m pip install --user uv && export PATH=$PATH:$HOME/.local/bin && uvx --from git+https://github.com/alliance-genome/zen-mcp-server.git zen-mcp-server"
                   ],
                   "env": {
                     "PATH": "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:$HOME/.local/bin",
@@ -209,7 +233,7 @@ jobs:
           
           # Allowed tools - zen tools only for large PRs or manual reviews
           allowed_tools: |
-            ${{ (github.event_name != 'pull_request' || steps.pr_size.outputs.use_zen_tools == 'true') && inputs.use_zen_tools && 'mcp__zen__codereview,mcp__zen__secaudit,mcp__zen__analyze,mcp__zen__testgen,mcp__zen__debug,mcp__zen__refactor,mcp__zen__chat,mcp__zen__consensus,mcp__zen__thinkdeep,mcp__zen__planner,mcp__zen__precommit,mcp__zen__tracer,mcp__zen__docgen,mcp__zen__challenge,mcp__zen__listmodels,mcp__zen__version,Bash,Edit,Read,Write,Glob,Grep,LS' || 'Bash,Edit,Read,Write,Glob,Grep,LS' }}
+            ${{ steps.zen_config.outputs.use_zen == 'true' && 'mcp__zen__codereview,mcp__zen__secaudit,mcp__zen__analyze,mcp__zen__testgen,mcp__zen__debug,mcp__zen__refactor,mcp__zen__chat,mcp__zen__consensus,mcp__zen__thinkdeep,mcp__zen__planner,mcp__zen__precommit,mcp__zen__tracer,mcp__zen__docgen,mcp__zen__challenge,mcp__zen__listmodels,mcp__zen__version,Bash,Edit,Read,Write,Glob,Grep,LS' || 'Bash,Edit,Read,Write,Glob,Grep,LS' }}
           
           # Environment variables for Claude
           claude_env: |
