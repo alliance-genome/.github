@@ -54,6 +54,8 @@ jobs:
 | `review_focus` | What to focus reviews on | `critical bugs and database performance` | No |
 | `trigger_phrase` | Phrase for manual reviews | `@claude` | No |
 | `use_zen_tools` | Enable enhanced analysis | `true` | No |
+| `pr_size_threshold` | Line count for zen tools | `300` | No |
+| `skip_threshold` | Line count to skip review | `25` | No |
 
 ### Usage Examples
 
@@ -108,6 +110,16 @@ jobs:
 2. **Manual Reviews**: Comment `@claude` on any PR or issue for targeted help
 3. **Enhanced Analysis**: Uses multiple AI models (Claude, o3, Gemini) for thorough review
 4. **Focused Scope**: Concentrates on critical issues to avoid noise
+
+### Three-Tier Review System
+
+The workflow automatically adjusts review depth based on PR size:
+
+- **< 25 lines**: Reviews are skipped entirely to save costs (trivial changes)
+- **25-300 lines**: Standard Claude review only 
+- **> 300 lines**: Enhanced multi-model analysis with zen tools (o3, Gemini)
+
+Manual reviews triggered by `@claude` always have access to zen tools regardless of PR size.
 
 ### Security
 
