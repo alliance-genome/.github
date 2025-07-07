@@ -67,10 +67,6 @@ jobs:
             echo "Error: skip_threshold must be an integer"
             exit 1
           fi
-          if ! [[ "${{ inputs.pr_size_threshold }}" =~ ^[0-9]+$ ]]; then
-            echo "Error: pr_size_threshold must be an integer"
-            exit 1
-          fi
           
           # Get the base and head commits
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
@@ -133,6 +129,7 @@ jobs:
               - **Implement Code Changes**: \`${{ inputs.trigger_phrase }} add error handling to the user login method\`
               - **Debug Issues**: \`${{ inputs.trigger_phrase }} help debug why the search is slow\`
               - **Analyze Architecture**: \`${{ inputs.trigger_phrase }} review the database schema changes\`
+              - **Perform another review**: \`${{ inputs.trigger_phrase }} Please review my changes\`
               
               Just comment \`${{ inputs.trigger_phrase }}\` followed by your request!`
             })
