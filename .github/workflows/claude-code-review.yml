@@ -198,11 +198,12 @@ jobs:
             ---
             💡 **Claude Code Capabilities**
             
-            I can help with more than just reviews! Try these:
-            - **Answer Questions**: `${{ inputs.trigger_phrase }} explain how the caching system works`
-            - **Implement Code Changes**: `${{ inputs.trigger_phrase }} add error handling to the user login method`
-            - **Debug Issues**: `${{ inputs.trigger_phrase }} help debug why the search is slow`
-            - **Analyze Architecture**: `${{ inputs.trigger_phrase }} review the database schema changes`
+            I caan help with additional commands! Try these:
+            - **Answer Questions**: `@claude explain how the caching system works`
+            - **Implement Code Changes**: `@claude add error handling to the user login method`
+            - **Debug Issues**: `@claude help debug why the search is slow`
+            - **Analyze Architecture**: `@claude review the database schema changes`
+            - **Perform another review**: `@claude Please review my changes`
             
             Just comment `${{ inputs.trigger_phrase }}` followed by your request!
           
