@@ -46,9 +46,11 @@ jobs:
       # This permission is necessary even though it may seem unused
       id-token: write
     if: |
-      github.event_name == 'pull_request' || 
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, inputs.trigger_phrase)) ||
-      github.event_name == 'workflow_dispatch'
+      github.actor != 'pjhale' && (
+        github.event_name == 'pull_request' || 
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, inputs.trigger_phrase)) ||
+        github.event_name == 'workflow_dispatch'
+      )
     
     steps:
       - name: Checkout repository
