@@ -6,7 +6,7 @@ on:
       model:
         description: 'Claude model to use'
         required: false
-        default: 'claude-sonnet-4-20250514'
+        default: 'claude-sonnet-4-5-20250929'
         type: string
       max_turns:
         description: 'Maximum conversation turns'
@@ -43,41 +43,42 @@ jobs:
       pull-requests: write
       issues: write
       # REQUIRED: Claude Code Action uses OIDC for GitHub authentication
-      # This permission is necessary even though it may seem unused
       id-token: write
+      # Required for Claude to read CI results on PRs
+      actions: read
     if: |
       github.actor != 'pjhale' && (
-        github.event_name == 'pull_request' || 
+        github.event_name == 'pull_request' ||
         (github.event_name == 'issue_comment' && contains(github.event.comment.body, inputs.trigger_phrase)) ||
         github.event_name == 'workflow_dispatch'
       )
-    
+
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0  # Need full history for diff calculation
-        
+
       - name: Calculate PR size
         id: pr_size
         if: github.event_name == 'pull_request'
         run: |
           set -eo pipefail
-          
+
           # Validate inputs are integers
           if ! [[ "${{ inputs.skip_threshold }}" =~ ^[0-9]+$ ]]; then
             echo "Error: skip_threshold must be an integer"
             exit 1
           fi
-          
+
           # Get the base and head commits
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-          
+
           # Calculate lines added and removed (filter out binary files)
           DIFF_STATS=$(git diff --numstat $BASE_SHA..$HEAD_SHA | grep -E '^[0-9]+\s+[0-9]+' || true)
           TOTAL_CHANGES=$(echo "$DIFF_STATS" | awk '{added+=$1; removed+=$2} END {print added+removed}')
-          
+
           # Handle empty or malformed output - ensure it's a valid number
           TOTAL_CHANGES=${TOTAL_CHANGES:-0}
           # Validate it's numeric, default to 0 if not
@@ -85,10 +86,10 @@ jobs:
             echo "Warning: Non-numeric diff result, defaulting to 0"
             TOTAL_CHANGES=0
           fi
-          
+
           echo "Total lines changed: $TOTAL_CHANGES"
           echo "total_changes=$TOTAL_CHANGES" >> $GITHUB_OUTPUT
-          
+
           # Determine review strategy based on PR size (safe numeric comparisons)
           # Fix #2: Force base-10 interpretation to prevent octal issues
           if (( 10#$TOTAL_CHANGES <= 10#${{ inputs.skip_threshold }} )); then
@@ -109,131 +110,105 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               body: `🤖 **Claude Code Review Skipped**
-              
+
               This PR has only **${{ steps.pr_size.outputs.total_changes }} lines changed** (<= ${{ inputs.skip_threshold }} lines).
-              
+
               Claude reviews are automatically skipped for trivial changes to save costs and reduce noise.
-              
+
               **Need a review anyway?** Comment \`${{ inputs.trigger_phrase }}\` to trigger a manual review.
-              
+
               ---
-              
+
               **Review strategy (current thresholds):**
               - **≤ ${{ inputs.skip_threshold }} lines**: Skipped - this PR
               - **> ${{ inputs.skip_threshold }} lines**: Standard Claude Sonnet review
-              
+
               ---
-              
+
               💡 **Claude Code Capabilities**
-              
+
               I can help with more than just reviews! Try these:
               - **Answer Questions**: \`${{ inputs.trigger_phrase }} explain how the caching system works\`
               - **Implement Code Changes**: \`${{ inputs.trigger_phrase }} add error handling to the user login method\`
               - **Debug Issues**: \`${{ inputs.trigger_phrase }} help debug why the search is slow\`
               - **Analyze Architecture**: \`${{ inputs.trigger_phrase }} review the database schema changes\`
               - **Perform another review**: \`${{ inputs.trigger_phrase }} Please review my changes\`
-              
+
               Just comment \`${{ inputs.trigger_phrase }}\` followed by your request!`
             })
-            
-      - name: Setup Claude Code Review
-        uses: anthropics/claude-code-action@beta
+
+      - name: Claude Code Review
+        uses: anthropics/claude-code-action@v1
         if: github.event_name != 'pull_request' || steps.pr_size.outputs.skip_review != 'true'
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           trigger_phrase: ${{ inputs.trigger_phrase }}
-          model: ${{ inputs.model }}
-          max_turns: ${{ inputs.max_turns }}
-          
-          # Custom instructions for Alliance repositories
-          custom_instructions: |
-            You are reviewing a PULL REQUEST DIFF for an Alliance of Genome Resources application.
-            
+
+          # PR-specific prompt with git diff instructions (only for automated PR reviews)
+          # For manual @claude triggers, the user's comment is the instruction
+          # General review guidance is in --append-system-prompt (applies to ALL event types)
+          prompt: |
+            ${{ github.event_name == 'pull_request' && format('
+            Review this pull request.
+
+            START by running: git diff origin/{0}...HEAD --name-status
+            Then examine the changed lines using: git diff origin/{0}...HEAD
+            ', github.base_ref) || '' }}
+
+          # CLI arguments (v1 format)
+          # --append-system-prompt provides base Alliance instructions for ALL event types
+          claude_args: |
+            --model ${{ inputs.model }}
+            --max-turns ${{ inputs.max_turns }}
+            --allowedTools "Bash,Edit,Read,Write,Glob,Grep,LS"
+            --append-system-prompt "You are assisting with an Alliance of Genome Resources application.
+
+            REPOSITORY: ${{ github.repository }}
+            REVIEW FOCUS: ${{ inputs.review_focus }}
+
             REVIEW APPROACH:
-            1. FIRST: Use `git diff` to understand what lines changed in this PR
-            2. SECOND: For changed functions/methods, you MAY read the surrounding context to understand:
-               - How the changed code integrates with existing functionality
-               - Whether the changes might break existing behavior
-               - If the changes are consistent with the codebase patterns
-            3. FOCUS: Your review comments must be about the CHANGES, not pre-existing code
-            
+            1. For code reviews, use git diff to understand what lines changed
+            2. For changed functions/methods, read the surrounding context to understand integration
+            3. Focus comments on CHANGES, not pre-existing code
+            4. Only flag issues INTRODUCED or WORSENED by the changes
+
             WHEN TO READ BROADER CONTEXT:
             - When a function signature changes (check callers)
             - When a method implementation changes (understand the full method)
             - When new code is added (verify it fits with surrounding code)
             - When imports/dependencies change (check usage)
-            
+
             REVIEW SCOPE - Only flag issues that are:
-            1. INTRODUCED or WORSENED by this PR's changes
-            2. Critical bugs that could cause data corruption or system failures
-            3. Database performance issues created by these changes
-            4. Breaking changes to existing functionality
-            
-            IMPORTANT: Many PRs are small fixes. If the changes look correct and don't introduce new issues, 
-            simply acknowledge the fix and say "Changes look good".
-            
+            1. Critical bugs that could cause data corruption or system failures
+            2. Database performance issues
+            3. Breaking changes to existing functionality
+
+            IMPORTANT: Many PRs are small fixes. If the changes look correct, simply say Changes look good.
+
             Keep reviews concise and actionable. Reference specific line numbers from the diff.
-            
-            IMPORTANT: Always end your review comments with developer usage instructions:
-            
+
+            IMPORTANT: Always end your responses with developer usage instructions:
+
             ---
-            💡 **Claude Code Capabilities**
-            
+            Claude Code Capabilities
+
             I can help with additional commands! Try these:
-            - **Answer Questions**: `@claude explain how the caching system works`
-            - **Implement Code Changes**: `@claude add error handling to the user login method`
-            - **Debug Issues**: `@claude help debug why the search is slow`
-            - **Analyze Architecture**: `@claude review the database schema changes`
-            - **Perform another review**: `@claude Please review my changes`
-            
-            Just comment `${{ inputs.trigger_phrase }}` followed by your request!
-          
-          # Direct prompt for automated reviews
-          direct_prompt: |
-            ${{ github.event_name == 'pull_request' && '
-            START by running: git diff origin/${{ github.base_ref }}...HEAD --name-status
-            Then examine the changed lines using: git diff origin/${{ github.base_ref }}...HEAD
-            
-            REVIEW STRATEGY:
-            1. Analyze the diff to understand what changed
-            2. For complex changes, read the surrounding context of modified functions/methods
-            3. Check if changes might break existing functionality
-            4. Verify changes follow project patterns
-            
-            CONTEXTUAL READING GUIDELINES:
-            - Read modified functions/methods in full to understand the changes
-            - Check callers if function signatures change
-            - Verify new code integrates properly with existing code
-            - DO NOT review or comment on unmodified code
-            
-            Focus your review on:
-            1. Critical bugs INTRODUCED by these changes
-            2. Breaking changes to existing functionality
-            3. Database performance issues CAUSED by these changes
-            4. Integration issues with existing code
-            
-            If the changes look correct and don''t introduce new issues, say so clearly.
-            Example good responses for clean PRs:
-            - "Changes look good, no blocking issues."
-            - "The changes are correct and safe to merge."
-            
-            Keep feedback concise, actionable, and directly tied to the diff.
-            
-            IMPORTANT: Always end your review with the developer capabilities section from your custom instructions.
-            ' || '' }}
-          
-          # MCP Configuration - no zen tools
-          mcp_config: |
-            {}
-          
-          # Allowed tools - standard tools only
-          allowed_tools: |
-            Bash,Edit,Read,Write,Glob,Grep,LS
-          
-          # Environment variables for Claude
-          claude_env: |
-            REPOSITORY: ${{ github.repository }}
-            ORGANIZATION: ${{ github.repository_owner }}
-            REVIEW_FOCUS: ${{ inputs.review_focus }}
-            PR_SIZE: ${{ github.event_name == 'pull_request' && steps.pr_size.outputs.total_changes || 'N/A' }}
-            REVIEW_SKIPPED: ${{ github.event_name == 'pull_request' && steps.pr_size.outputs.skip_review || 'false' }}
+            - Answer Questions: ${{ inputs.trigger_phrase }} explain how the caching system works
+            - Implement Code Changes: ${{ inputs.trigger_phrase }} add error handling to the user login method
+            - Debug Issues: ${{ inputs.trigger_phrase }} help debug why the search is slow
+            - Analyze Architecture: ${{ inputs.trigger_phrase }} review the database schema changes
+            - Perform another review: ${{ inputs.trigger_phrase }} Please review my changes
+
+            Just comment ${{ inputs.trigger_phrase }} followed by your request!"
+
+          # Environment variables via settings (v1 format - replaces claude_env)
+          settings: |
+            {
+              "env": {
+                "REPOSITORY": "${{ github.repository }}",
+                "ORGANIZATION": "${{ github.repository_owner }}",
+                "REVIEW_FOCUS": "${{ inputs.review_focus }}",
+                "PR_SIZE": "${{ github.event_name == 'pull_request' && steps.pr_size.outputs.total_changes || 'N/A' }}",
+                "REVIEW_SKIPPED": "${{ github.event_name == 'pull_request' && steps.pr_size.outputs.skip_review || 'false' }}"
+              }
+            }
