@@ -149,11 +149,19 @@ jobs:
           # General review guidance is in --append-system-prompt (applies to ALL event types)
           prompt: |
             ${{ github.event_name == 'pull_request' && format('
+            REPO: {1}
+            PR NUMBER: {2}
+
             Review this pull request.
 
             START by running: git diff origin/{0}...HEAD --name-status
             Then examine the changed lines using: git diff origin/{0}...HEAD
-            ', github.base_ref) || '' }}
+
+            IMPORTANT: You MUST post your review as a GitHub PR comment using:
+            gh pr comment {2} --body "YOUR_REVIEW_HERE"
+
+            Do NOT just output text - you must use the gh command to post your review to the PR.
+            ', github.base_ref, github.repository, github.event.pull_request.number) || '' }}
 
           # CLI arguments (v1 format)
           # --append-system-prompt provides base Alliance instructions for ALL event types
@@ -186,6 +194,8 @@ jobs:
             IMPORTANT: Many PRs are small fixes. If the changes look correct, simply say Changes look good.
 
             Keep reviews concise and actionable. Reference specific line numbers from the diff.
+
+            CRITICAL: You MUST post your review to the PR using gh pr comment. Do not just output text.
 
             IMPORTANT: Always end your responses with developer usage instructions:
 
