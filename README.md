@@ -37,7 +37,6 @@ jobs:
   claude-review:
     uses: alliance-genome/.github/.github/workflows/claude-code-review.yml@main
     with:
-      model: claude-sonnet-4-20250514
       use_zen_tools: true
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -45,11 +44,13 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 ```
 
+> **Note:** The model defaults to the `CLAUDE_PR_REVIEW_MODEL` GitHub org/repo variable (e.g., `claude-sonnet-4-6`). To override, pass `model:` explicitly.
+
 ### Configuration Options
 
 | Input | Description | Default | Required |
 |-------|-------------|---------|----------|
-| `model` | Claude model to use | `claude-sonnet-4-20250514` | No |
+| `model` | Claude model to use. If empty, falls back to `CLAUDE_PR_REVIEW_MODEL` org/repo variable. | `''` (empty) | No |
 | `max_turns` | Maximum conversation turns | `10` | No |
 | `review_focus` | What to focus reviews on | `critical bugs and database performance` | No |
 | `trigger_phrase` | Phrase for manual reviews | `@claude` | No |
@@ -68,13 +69,13 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
 
-#### Custom Configuration
+#### Custom Configuration (with explicit model override)
 ```yaml
 jobs:
   claude-review:
     uses: alliance-genome/.github/.github/workflows/claude-code-review.yml@main
     with:
-      model: claude-sonnet-4-20250514
+      model: claude-sonnet-4-6  # Override the org variable
       max_turns: "5"
       review_focus: "security vulnerabilities and performance"
       trigger_phrase: "@ai-review"
