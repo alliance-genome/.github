@@ -4,9 +4,9 @@ on:
   workflow_call:
     inputs:
       model:
-        description: 'Claude model to use'
+        description: 'Claude model to use. If empty, falls back to CLAUDE_PR_REVIEW_MODEL org/repo variable.'
         required: false
-        default: 'claude-sonnet-4-5-20250929'
+        default: ''
         type: string
       max_turns:
         description: 'Maximum conversation turns'
@@ -166,7 +166,7 @@ jobs:
           # CLI arguments (v1 format)
           # --append-system-prompt provides base Alliance instructions for ALL event types
           claude_args: |
-            --model ${{ inputs.model }}
+            --model ${{ inputs.model || vars.CLAUDE_PR_REVIEW_MODEL }}
             --max-turns ${{ inputs.max_turns }}
             --allowedTools "Bash,Edit,Read,Write,Glob,Grep,LS"
             --append-system-prompt "You are assisting with an Alliance of Genome Resources application.
