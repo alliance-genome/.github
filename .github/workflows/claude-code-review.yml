@@ -164,7 +164,7 @@ jobs:
 
       - name: Claude Code Review
         id: claude_review
-        uses: anthropics/claude-code-action@v1.0.55  # Pin: SHA edd85d61533cbba7b57ed0ca4af1750b1fdfd3c4
+        uses: anthropics/claude-code-action@v1
         if: github.event_name != 'pull_request' || steps.pr_size.outputs.skip_review != 'true'
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
