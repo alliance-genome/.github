@@ -38,6 +38,7 @@ on:
 jobs:
   claude-review:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     permissions:
       contents: read
       pull-requests: write
@@ -47,7 +48,8 @@ jobs:
       # Required for Claude to read CI results on PRs
       actions: read
     if: |
-      github.actor != 'pjhale' && (
+      github.actor != 'pjhale' &&
+      github.actor != 'claude[bot]' && (
         github.event_name == 'pull_request' ||
         (github.event_name == 'issue_comment' && contains(github.event.comment.body, inputs.trigger_phrase)) ||
         github.event_name == 'workflow_dispatch'
@@ -137,8 +139,32 @@ jobs:
               Just comment \`${{ inputs.trigger_phrase }}\` followed by your request!`
             })
 
+      - name: Count existing bot comments
+        id: pre_check
+        if: github.event_name != 'pull_request' || steps.pr_size.outputs.skip_review != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = context.issue?.number || context.payload?.pull_request?.number;
+            if (!issueNumber) {
+              core.setOutput('baseline_count', '0');
+              core.setOutput('issue_number', '0');
+              return;
+            }
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              per_page: 100
+            });
+            const botComments = comments.filter(c => c.user.login === 'claude[bot]');
+            core.setOutput('baseline_count', String(botComments.length));
+            core.setOutput('issue_number', String(issueNumber));
+            console.log(`Baseline: ${botComments.length} claude[bot] comments on #${issueNumber}`);
+
       - name: Claude Code Review
-        uses: anthropics/claude-code-action@v1
+        id: claude_review
+        uses: anthropics/claude-code-action@v1.0.55  # Pin: SHA edd85d61533cbba7b57ed0ca4af1750b1fdfd3c4
         if: github.event_name != 'pull_request' || steps.pr_size.outputs.skip_review != 'true'
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -222,3 +248,89 @@ jobs:
                 "REVIEW_SKIPPED": "${{ github.event_name == 'pull_request' && steps.pr_size.outputs.skip_review || 'false' }}"
               }
             }
+
+      - name: Log execution metrics
+        if: always() && steps.claude_review.outcome != 'skipped'
+        shell: bash
+        run: |
+          EXEC_FILE="${{ steps.claude_review.outputs.execution_file }}"
+          if [ -n "$EXEC_FILE" ] && [ -f "$EXEC_FILE" ]; then
+            echo "=== Claude Execution Metrics ==="
+            python3 -c "
+          import json, sys
+          with open('$EXEC_FILE') as f:
+              data = json.load(f)
+          for key in ['num_turns', 'duration_ms', 'total_cost_usd', 'is_error', 'subtype']:
+              if key in data:
+                  print(f'{key}: {data[key]}')
+          " 2>/dev/null || echo "Could not parse execution file"
+          else
+            echo "No execution file found (step may have been cancelled)"
+          fi
+
+      - name: Verify review posted
+        if: always() && steps.claude_review.outcome != 'skipped'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = parseInt('${{ steps.pre_check.outputs.issue_number }}');
+            if (!issueNumber) {
+              console.log('No issue/PR number found — skipping verification');
+              return;
+            }
+
+            const baselineCount = parseInt('${{ steps.pre_check.outputs.baseline_count }}');
+            const reviewOutcome = '${{ steps.claude_review.outcome }}';
+
+            // Count current claude[bot] comments
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              per_page: 100
+            });
+            const currentBotComments = comments.filter(c => c.user.login === 'claude[bot]');
+
+            console.log(`Baseline: ${baselineCount}, Current: ${currentBotComments.length}, Review outcome: ${reviewOutcome}`);
+
+            if (currentBotComments.length > baselineCount) {
+              console.log('Review comment was posted successfully');
+              return;
+            }
+
+            // No new comment was posted — determine the reason and post a fallback
+            let body;
+            if (reviewOutcome === 'cancelled') {
+              body = [
+                '**Review Timed Out**',
+                '',
+                'The Claude Code review exceeded the 8-minute timeout and was cancelled.',
+                'This usually means the review was unusually complex or encountered an issue.',
+                '',
+                'Please try again — if this keeps happening, contact the repository maintainers.',
+                '',
+                '---',
+                '*Automated fallback from the Claude Code Review workflow.*'
+              ].join('\n');
+            } else {
+              body = [
+                '**Review Incomplete**',
+                '',
+                'Claude completed execution but did not post a review comment.',
+                'This is a known intermittent issue being investigated upstream.',
+                '',
+                'Please try again — if this keeps happening, contact the repository maintainers.',
+                '',
+                '---',
+                '*Automated fallback from the Claude Code Review workflow.*'
+              ].join('\n');
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: body
+            });
+
+            core.setFailed(`Claude Code Review did not post a comment (outcome: ${reviewOutcome}) — fallback message posted`);
