@@ -30,6 +30,16 @@ on:
         required: false
         default: '3'
         type: string
+      max_retries:
+        description: 'Maximum auto-retry attempts when Claude completes but does not post a comment'
+        required: false
+        default: '3'
+        type: string
+      notify_on_failure:
+        description: 'GitHub usernames to mention on review failures/retries (comma-separated, without @)'
+        required: false
+        default: ''
+        type: string
     secrets:
       ANTHROPIC_API_KEY:
         description: 'Anthropic API key for Claude'
@@ -249,26 +259,47 @@ jobs:
               }
             }
 
-      - name: Log execution metrics
+      - name: Log execution diagnostics
         if: always() && steps.claude_review.outcome != 'skipped'
         shell: bash
         run: |
+          echo "=== Claude Code Review Diagnostics ==="
+          echo "Step outcome: ${{ steps.claude_review.outcome }}"
+          echo "Conclusion output: ${{ steps.claude_review.outputs.conclusion }}"
+          echo "Session ID: ${{ steps.claude_review.outputs.session_id }}"
+
           EXEC_FILE="${{ steps.claude_review.outputs.execution_file }}"
           if [ -n "$EXEC_FILE" ] && [ -f "$EXEC_FILE" ]; then
-            echo "=== Claude Execution Metrics ==="
-            python3 -c "
-          import json, sys
-          with open('$EXEC_FILE') as f:
-              data = json.load(f)
-          for key in ['num_turns', 'duration_ms', 'total_cost_usd', 'is_error', 'subtype']:
-              if key in data:
-                  print(f'{key}: {data[key]}')
-          " 2>/dev/null || echo "Could not parse execution file"
+            echo ""
+            echo "=== Result Message (from execution file) ==="
+            # The execution file is a JSON array of SDK messages.
+            # The last element is the 'result' message containing metrics.
+            jq '.[-1] | {type, subtype, is_error, num_turns, duration_ms, duration_api_ms, total_cost_usd}' "$EXEC_FILE" 2>/dev/null || echo "Could not parse result message"
+
+            echo ""
+            echo "=== Tool Usage Summary ==="
+            # Count tool calls by name to see what Claude actually did
+            jq '[.[] | select(.type == "assistant") | .message.content[]? | select(.type == "tool_use") | .name] | group_by(.) | map({tool: .[0], count: length}) | sort_by(-.count)' "$EXEC_FILE" 2>/dev/null || echo "Could not parse tool usage"
+
+            echo ""
+            echo "=== Claude Result Text (first 500 chars) ==="
+            jq -r '.[-1].result // "No result text found" | .[0:500]' "$EXEC_FILE" 2>/dev/null || echo "Could not extract result text"
           else
-            echo "No execution file found (step may have been cancelled)"
+            echo ""
+            echo "WARNING: No execution file found at: $EXEC_FILE"
+            echo "This may indicate the step was cancelled or Claude failed to start."
           fi
 
-      - name: Verify review posted
+      - name: Upload execution transcript
+        if: always() && steps.claude_review.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-execution-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.claude_review.outputs.execution_file }}
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Verify review and auto-retry on silent drop
         if: always() && steps.claude_review.outcome != 'skipped'
         uses: actions/github-script@v7
         with:
@@ -281,6 +312,10 @@ jobs:
 
             const baselineCount = parseInt('${{ steps.pre_check.outputs.baseline_count }}');
             const reviewOutcome = '${{ steps.claude_review.outcome }}';
+            const maxRetries = parseInt('${{ inputs.max_retries }}') || 3;
+            const triggerPhrase = '${{ inputs.trigger_phrase }}';
+            const notifyUsers = '${{ inputs.notify_on_failure }}'.split(',').map(u => u.trim()).filter(Boolean);
+            const mentionStr = notifyUsers.length > 0 ? '\n\ncc ' + notifyUsers.map(u => `@${u}`).join(' ') : '';
 
             // Count current claude[bot] comments
             const comments = await github.paginate(github.rest.issues.listComments, {
@@ -298,10 +333,18 @@ jobs:
               return;
             }
 
-            // No new comment was posted — determine the reason and post a fallback
-            let body;
+            // --- No new comment was posted ---
+
+            // Count existing auto-retry comments on this PR to prevent infinite loops
+            const retryComments = comments.filter(c =>
+              c.body && c.body.includes('auto-retry') && c.body.includes('Claude Code Review')
+            );
+            const retryCount = retryComments.length;
+            console.log(`Auto-retry count: ${retryCount}/${maxRetries}`);
+
+            // Handle timeout — don't auto-retry (PR is likely too complex, would timeout again)
             if (reviewOutcome === 'cancelled') {
-              body = [
+              const body = [
                 '**Review Timed Out**',
                 '',
                 'The Claude Code review exceeded the 8-minute timeout and was cancelled.',
@@ -309,28 +352,67 @@ jobs:
                 '',
                 'Please try again — if this keeps happening, contact the repository maintainers.',
                 '',
-                '---',
-                '*Automated fallback from the Claude Code Review workflow.*'
-              ].join('\n');
-            } else {
-              body = [
-                '**Review Incomplete**',
-                '',
-                'Claude completed execution but did not post a review comment.',
-                'This is a known intermittent issue being investigated upstream.',
-                '',
-                'Please try again — if this keeps happening, contact the repository maintainers.',
+                `[View execution logs](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) | [Download transcript](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}#artifacts)`,
                 '',
                 '---',
-                '*Automated fallback from the Claude Code Review workflow.*'
+                `*Automated fallback from the Claude Code Review workflow.*${mentionStr}`
               ].join('\n');
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: body
+              });
+              core.setFailed('Claude Code Review timed out — no auto-retry for timeouts');
+              return;
             }
 
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issueNumber,
-              body: body
-            });
+            // Handle silent drop — auto-retry if under limit
+            // NOTE: The retry comment is posted by github-actions[bot] (via GITHUB_TOKEN),
+            // NOT claude[bot]. The actor filter on line 62 only blocks claude[bot],
+            // so the retry comment will successfully trigger a new workflow run.
+            if (retryCount < maxRetries) {
+              const attemptNum = retryCount + 1;
+              const body = [
+                `${triggerPhrase} Please review my changes`,
+                '',
+                '---',
+                `*Claude Code Review auto-retry (attempt ${attemptNum}/${maxRetries}) — previous review completed but did not post a comment.*`,
+                '',
+                `[View previous run logs](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) | [Download transcript](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}#artifacts)${mentionStr}`
+              ].join('\n');
 
-            core.setFailed(`Claude Code Review did not post a comment (outcome: ${reviewOutcome}) — fallback message posted`);
+              console.log(`Posting auto-retry comment (attempt ${attemptNum}/${maxRetries})`);
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: body
+              });
+              // Mark as failed so this run shows the drop, even though a retry is pending
+              core.setFailed(`Claude Code Review silent drop — auto-retry ${attemptNum}/${maxRetries} posted`);
+            } else {
+              // Max retries exceeded — post final fallback
+              const body = [
+                '**Review Failed After Multiple Attempts**',
+                '',
+                `Claude completed ${maxRetries} review attempt(s) but did not post a comment each time.`,
+                'This is a known intermittent issue being investigated upstream.',
+                '',
+                'A human review is needed for this PR.',
+                '',
+                `[View latest run logs](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) | [Download transcript](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}#artifacts)`,
+                '',
+                '---',
+                `*Automated fallback from the Claude Code Review workflow.*${mentionStr}`
+              ].join('\n');
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: body
+              });
+              core.setFailed(`Claude Code Review failed after ${maxRetries} auto-retry attempts`);
+            }
