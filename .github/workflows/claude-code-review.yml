@@ -180,9 +180,12 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           trigger_phrase: ${{ inputs.trigger_phrase }}
 
-          # PR-specific prompt with git diff instructions (only for automated PR reviews)
-          # For manual @claude triggers, the user's comment is the instruction
-          # General review guidance is in --append-system-prompt (applies to ALL event types)
+          # Event-specific prompt:
+          # - pull_request: Full review with diff instructions
+          # - issue_comment: Read user's comment and respond (with PR number so Claude
+          #   doesn't have to guess). Without this, the action sends NO user message
+          #   in agent mode, causing intermittent "silent drops" where Claude just
+          #   outputs a generic greeting and exits.
           prompt: |
             ${{ github.event_name == 'pull_request' && format('
             REPO: {1}
@@ -198,6 +201,22 @@ jobs:
 
             Do NOT just output text - you must use the gh command to post your review to the PR.
             ', github.base_ref, github.repository, github.event.pull_request.number) || '' }}
+            ${{ github.event_name == 'issue_comment' && format('
+            REPO: {0}
+            PR NUMBER: {1}
+
+            A user has commented on this PR requesting your assistance.
+
+            START by reading their comment: gh pr view {1} --comments --json comments --jq ".comments[-1].body"
+            Then check the PR diff: git diff origin/main...HEAD
+
+            If they are asking for a review or check, perform a full code review of the changes.
+
+            IMPORTANT: You MUST post your response as a GitHub PR comment using:
+            gh pr comment {1} --body "YOUR_RESPONSE_HERE"
+
+            Do NOT just output text - you must use the gh command to post your response to the PR.
+            ', github.repository, github.event.issue.number) || '' }}
 
           # CLI arguments (v1 format)
           # --append-system-prompt provides base Alliance instructions for ALL event types
