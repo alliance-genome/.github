@@ -55,7 +55,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Calculate PR size and skip trivial changes
         id: pr_size
@@ -85,29 +85,37 @@ jobs:
               body: `**Claude Code Review Skipped** — only **${{ steps.pr_size.outputs.total_changes }}** lines changed (<= ${{ inputs.skip_threshold }}). Comment \`${{ inputs.trigger_phrase }} review my changes\` to request one.`
             })
 
-      - name: Claude Code Review
+      # Automation mode: auto-review on pull_request events.
+      # Per official docs: provide REPO, PR NUMBER, gh pr comment instruction, and --allowedTools.
+      - name: Claude Code Review (auto-review)
         uses: anthropics/claude-code-action@v1
-        if: github.event_name != 'pull_request' || steps.pr_size.outputs.skip_review != 'true'
+        if: github.event_name == 'pull_request' && steps.pr_size.outputs.skip_review != 'true'
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          trigger_phrase: ${{ inputs.trigger_phrase }}
-
-          # Only provide a prompt for pull_request events (auto-review).
-          # For issue_comment events (@claude mentions), the action handles
-          # routing natively — no custom prompt needed.
           prompt: |
-            ${{ github.event_name == 'pull_request' && format('
-            REPO: {1}
-            PR NUMBER: {2}
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
 
-            Review this PR. Focus on {0}.
+            Review this PR. Focus on ${{ inputs.review_focus }}.
             Only flag issues introduced by the changes, not pre-existing code.
             If the changes look correct, say so briefly.
 
             Use `gh pr comment` for top-level feedback.
             Only post GitHub comments — do not submit review text as messages.
-            ', inputs.review_focus, github.repository, github.event.pull_request.number) || '' }}
 
+          claude_args: |
+            --model ${{ inputs.model || vars.CLAUDE_PR_REVIEW_MODEL }}
+            --max-turns ${{ inputs.max_turns }}
+            --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Read,Glob,Grep"
+
+      # Interactive mode: respond to @claude mentions on PRs.
+      # Per official docs: no prompt, no --allowedTools — action auto-detects tag mode.
+      - name: Claude Code Review (interactive)
+        uses: anthropics/claude-code-action@v1
+        if: github.event_name == 'issue_comment'
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          trigger_phrase: ${{ inputs.trigger_phrase }}
           claude_args: |
             --model ${{ inputs.model || vars.CLAUDE_PR_REVIEW_MODEL }}
             --max-turns ${{ inputs.max_turns }}
