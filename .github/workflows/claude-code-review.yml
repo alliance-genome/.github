@@ -97,12 +97,18 @@ jobs:
           # routing natively — no custom prompt needed.
           prompt: |
             ${{ github.event_name == 'pull_request' && format('
+            REPO: {1}
+            PR NUMBER: {2}
+
             Review this PR. Focus on {0}.
             Only flag issues introduced by the changes, not pre-existing code.
             If the changes look correct, say so briefly.
-            Post your review as a PR comment using gh pr comment.
-            ', inputs.review_focus) || '' }}
+
+            Use `gh pr comment` for top-level feedback.
+            Only post GitHub comments — do not submit review text as messages.
+            ', inputs.review_focus, github.repository, github.event.pull_request.number) || '' }}
 
           claude_args: |
             --model ${{ inputs.model || vars.CLAUDE_PR_REVIEW_MODEL }}
             --max-turns ${{ inputs.max_turns }}
+            --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Read,Glob,Grep"
