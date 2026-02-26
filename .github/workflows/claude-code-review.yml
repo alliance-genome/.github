@@ -100,6 +100,7 @@ jobs:
             Review this PR. Focus on {0}.
             Only flag issues introduced by the changes, not pre-existing code.
             If the changes look correct, say so briefly.
+            Post your review as a PR comment using gh pr comment.
             ', inputs.review_focus) || '' }}
 
           claude_args: |
