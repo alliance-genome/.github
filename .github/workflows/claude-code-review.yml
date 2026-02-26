@@ -55,8 +55,8 @@ jobs:
       issues: write
       # REQUIRED: Claude Code Action uses OIDC for GitHub authentication
       id-token: write
-      # Required for Claude to read CI results on PRs
-      actions: read
+      # Required for Claude to read CI results on PRs AND for auto-retry via gh run rerun
+      actions: write
     if: |
       github.actor != 'pjhale' &&
       github.actor != 'claude[bot]' && (
@@ -332,7 +332,6 @@ jobs:
             const baselineCount = parseInt('${{ steps.pre_check.outputs.baseline_count }}');
             const reviewOutcome = '${{ steps.claude_review.outcome }}';
             const maxRetries = parseInt('${{ inputs.max_retries }}') || 3;
-            const triggerPhrase = '${{ inputs.trigger_phrase }}';
             const notifyUsers = '${{ inputs.notify_on_failure }}'.split(',').map(u => u.trim()).filter(Boolean);
             const mentionStr = notifyUsers.length > 0 ? '\n\ncc ' + notifyUsers.map(u => `@${u}`).join(' ') : '';
 
@@ -354,12 +353,11 @@ jobs:
 
             // --- No new comment was posted ---
 
-            // Count existing auto-retry comments on this PR to prevent infinite loops
-            const retryComments = comments.filter(c =>
-              c.body && c.body.includes('auto-retry') && c.body.includes('Claude Code Review')
-            );
-            const retryCount = retryComments.length;
-            console.log(`Auto-retry count: ${retryCount}/${maxRetries}`);
+            // Use github.run_attempt to track retries instead of counting PR comments.
+            // run_attempt starts at 1 for the first run, increments with each rerun.
+            const runAttempt = parseInt('${{ github.run_attempt }}') || 1;
+            const retriesUsed = runAttempt - 1;
+            console.log(`Run attempt: ${runAttempt}, Retries used: ${retriesUsed}/${maxRetries}`);
 
             // Handle timeout — don't auto-retry (PR is likely too complex, would timeout again)
             if (reviewOutcome === 'cancelled') {
@@ -387,36 +385,52 @@ jobs:
               return;
             }
 
-            // Handle silent drop — auto-retry if under limit
-            // NOTE: The retry comment is posted by github-actions[bot] (via GITHUB_TOKEN),
-            // NOT claude[bot]. The actor filter on line 62 only blocks claude[bot],
-            // so the retry comment will successfully trigger a new workflow run.
-            if (retryCount < maxRetries) {
-              const attemptNum = retryCount + 1;
-              const body = [
-                `${triggerPhrase} Please review my changes`,
-                '',
-                '---',
-                `*Claude Code Review auto-retry (attempt ${attemptNum}/${maxRetries}) — previous review completed but did not post a comment.*`,
-                '',
-                `[View previous run logs](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) | [Download transcript](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}#artifacts)${mentionStr}`
-              ].join('\n');
+            // Handle silent drop — auto-retry via gh run rerun if under limit.
+            // Previous approach posted @claude comments to trigger issue_comment events,
+            // but GITHUB_TOKEN events don't create new workflow runs (GitHub anti-loop
+            // protection). Using the rerun API bypasses this entirely.
+            if (retriesUsed < maxRetries) {
+              const attemptNum = retriesUsed + 1;
+              console.log(`Triggering auto-retry via run rerun (attempt ${attemptNum}/${maxRetries})`);
 
-              console.log(`Posting auto-retry comment (attempt ${attemptNum}/${maxRetries})`);
+              // Post a notification comment so PR participants know what's happening
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: issueNumber,
-                body: body
+                body: [
+                  `**Claude Code Review auto-retry (attempt ${attemptNum}/${maxRetries})**`,
+                  '',
+                  'Previous review completed but did not post a comment. Re-running automatically.',
+                  '',
+                  `[View previous run logs](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) | [Download transcript](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}#artifacts)${mentionStr}`
+                ].join('\n')
               });
-              // Mark as failed so this run shows the drop, even though a retry is pending
-              core.setFailed(`Claude Code Review silent drop — auto-retry ${attemptNum}/${maxRetries} posted`);
+
+              // Trigger a rerun of this workflow run. This preserves the original
+              // event context (PR number, base ref, head SHA) and increments
+              // github.run_attempt, which we use to track retry count.
+              // Requires actions: write in both the reusable workflow AND the caller.
+              try {
+                await github.request('POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun', {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: context.runId
+                });
+                core.setFailed(`Claude Code Review silent drop — rerun triggered (attempt ${attemptNum}/${maxRetries})`);
+              } catch (rerunError) {
+                // If rerun fails (e.g. caller hasn't granted actions: write yet),
+                // log the error but don't crash — the notification comment was already posted.
+                console.log(`Rerun API failed: ${rerunError.message}`);
+                console.log('The caller workflow may need actions: write permission.');
+                core.setFailed(`Claude Code Review silent drop — rerun failed: ${rerunError.message}`);
+              }
             } else {
               // Max retries exceeded — post final fallback
               const body = [
                 '**Review Failed After Multiple Attempts**',
                 '',
-                `Claude completed ${maxRetries} review attempt(s) but did not post a comment each time.`,
+                `Claude completed ${maxRetries + 1} review attempt(s) but did not post a comment each time.`,
                 'This is a known intermittent issue being investigated upstream.',
                 '',
                 'A human review is needed for this PR.',
