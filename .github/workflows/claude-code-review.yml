@@ -111,4 +111,3 @@ jobs:
           claude_args: |
             --model ${{ inputs.model || vars.CLAUDE_PR_REVIEW_MODEL }}
             --max-turns ${{ inputs.max_turns }}
-            --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Read,Glob,Grep"
