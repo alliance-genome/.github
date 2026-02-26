@@ -284,6 +284,7 @@ jobs:
 
       - name: Upload transcript (Attempt 1)
         if: always() && steps.claude_review.outcome != 'skipped'
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: claude-execution-${{ github.run_id }}-attempt-1
@@ -336,7 +337,7 @@ jobs:
         id: claude_retry
         continue-on-error: true
         uses: anthropics/claude-code-action@v1
-        if: steps.verify_1.outputs.needs_retry == 'true'
+        if: always() && steps.verify_1.outputs.needs_retry == 'true'
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           trigger_phrase: ${{ inputs.trigger_phrase }}
@@ -429,6 +430,7 @@ jobs:
 
       - name: Upload transcript (Retry)
         if: always() && steps.claude_retry.outcome != 'skipped'
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: claude-execution-${{ github.run_id }}-attempt-2
