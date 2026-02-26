@@ -16,29 +16,17 @@ on:
       review_focus:
         description: 'What to focus the review on'
         required: false
-        default: 'critical bugs and database performance'
+        default: 'correctness, bugs, and security'
         type: string
       trigger_phrase:
         description: 'Phrase to trigger manual reviews'
         required: false
         default: '@claude'
         type: string
-      # Updated thresholds based on PR analysis
-      # Skip 10th percentile is ~2-3 lines, using 3 to be conservative
       skip_threshold:
-        description: 'Line count threshold to skip reviews entirely'
+        description: 'Line count threshold to skip reviews entirely (0=disable skip)'
         required: false
         default: '3'
-        type: string
-      max_retries:
-        description: 'Maximum auto-retry attempts when Claude completes but does not post a comment (0=disable, max 3)'
-        required: false
-        default: '1'
-        type: string
-      notify_on_failure:
-        description: 'GitHub usernames to mention on review failures/retries (comma-separated, without @)'
-        required: false
-        default: ''
         type: string
     secrets:
       ANTHROPIC_API_KEY:
@@ -48,14 +36,12 @@ on:
 jobs:
   claude-review:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: write
       issues: write
-      # REQUIRED: Claude Code Action uses OIDC for GitHub authentication
       id-token: write
-      # Required for Claude to read CI results on PRs
       actions: read
     if: |
       github.actor != 'pjhale' &&
@@ -69,46 +55,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          fetch-depth: 0  # Need full history for diff calculation
+          fetch-depth: 0
 
-      - name: Calculate PR size
+      - name: Calculate PR size and skip trivial changes
         id: pr_size
         if: github.event_name == 'pull_request'
         run: |
           set -eo pipefail
-
-          # Validate inputs are integers
-          if ! [[ "${{ inputs.skip_threshold }}" =~ ^[0-9]+$ ]]; then
-            echo "Error: skip_threshold must be an integer"
-            exit 1
-          fi
-
-          # Get the base and head commits
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-
-          # Calculate lines added and removed (filter out binary files)
-          DIFF_STATS=$(git diff --numstat $BASE_SHA..$HEAD_SHA | grep -E '^[0-9]+\s+[0-9]+' || true)
-          TOTAL_CHANGES=$(echo "$DIFF_STATS" | awk '{added+=$1; removed+=$2} END {print added+removed}')
-
-          # Handle empty or malformed output - ensure it's a valid number
-          TOTAL_CHANGES=${TOTAL_CHANGES:-0}
-          # Validate it's numeric, default to 0 if not
-          if ! [[ "$TOTAL_CHANGES" =~ ^[0-9]+$ ]]; then
-            echo "Warning: Non-numeric diff result, defaulting to 0"
-            TOTAL_CHANGES=0
-          fi
-
-          echo "Total lines changed: $TOTAL_CHANGES"
-          echo "total_changes=$TOTAL_CHANGES" >> $GITHUB_OUTPUT
-
-          # Determine review strategy based on PR size (safe numeric comparisons)
-          # Fix #2: Force base-10 interpretation to prevent octal issues
-          if (( 10#$TOTAL_CHANGES <= 10#${{ inputs.skip_threshold }} )); then
-            echo "Trivial PR detected (<=${{ inputs.skip_threshold }} lines) - skipping Claude review"
+          DIFF_STATS=$(git diff --numstat "$BASE_SHA".."$HEAD_SHA" | grep -E '^[0-9]+\s+[0-9]+' || true)
+          TOTAL=$(echo "$DIFF_STATS" | awk '{s+=$1+$2} END {print s+0}')
+          echo "total_changes=$TOTAL" >> $GITHUB_OUTPUT
+          if (( 10#${TOTAL:-0} <= 10#${{ inputs.skip_threshold }} )); then
             echo "skip_review=true" >> $GITHUB_OUTPUT
           else
-            echo "Standard PR detected (>${{ inputs.skip_threshold }} lines) - using Claude Sonnet review"
             echo "skip_review=false" >> $GITHUB_OUTPUT
           fi
 
@@ -121,446 +82,26 @@ jobs:
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `🤖 **Claude Code Review Skipped**
-
-              This PR has only **${{ steps.pr_size.outputs.total_changes }} lines changed** (<= ${{ inputs.skip_threshold }} lines).
-
-              Claude reviews are automatically skipped for trivial changes to save costs and reduce noise.
-
-              **Need a review anyway?** Comment \`${{ inputs.trigger_phrase }}\` to trigger a manual review.
-
-              ---
-
-              **Review strategy (current thresholds):**
-              - **≤ ${{ inputs.skip_threshold }} lines**: Skipped - this PR
-              - **> ${{ inputs.skip_threshold }} lines**: Standard Claude Sonnet review
-
-              ---
-
-              💡 **Claude Code Capabilities**
-
-              I can help with more than just reviews! Try these:
-              - **Answer Questions**: \`${{ inputs.trigger_phrase }} explain how the caching system works\`
-              - **Implement Code Changes**: \`${{ inputs.trigger_phrase }} add error handling to the user login method\`
-              - **Debug Issues**: \`${{ inputs.trigger_phrase }} help debug why the search is slow\`
-              - **Analyze Architecture**: \`${{ inputs.trigger_phrase }} review the database schema changes\`
-              - **Perform another review**: \`${{ inputs.trigger_phrase }} Please review my changes\`
-
-              Just comment \`${{ inputs.trigger_phrase }}\` followed by your request!`
+              body: `**Claude Code Review Skipped** — only **${{ steps.pr_size.outputs.total_changes }}** lines changed (<= ${{ inputs.skip_threshold }}). Comment \`${{ inputs.trigger_phrase }} review my changes\` to request one.`
             })
 
-      - name: Count existing bot comments
-        id: pre_check
-        if: github.event_name != 'pull_request' || steps.pr_size.outputs.skip_review != 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const issueNumber = context.issue?.number || context.payload?.pull_request?.number;
-            if (!issueNumber) {
-              core.setOutput('baseline_count', '0');
-              core.setOutput('issue_number', '0');
-              return;
-            }
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issueNumber,
-              per_page: 100
-            });
-            const botComments = comments.filter(c => c.user.login === 'claude[bot]');
-            core.setOutput('baseline_count', String(botComments.length));
-            core.setOutput('issue_number', String(issueNumber));
-            console.log(`Baseline: ${botComments.length} claude[bot] comments on #${issueNumber}`);
-
-      # ================================================================
-      # ATTEMPT 1
-      # ================================================================
-      - name: Claude Code Review (Attempt 1)
-        id: claude_review
-        continue-on-error: true
+      - name: Claude Code Review
         uses: anthropics/claude-code-action@v1
         if: github.event_name != 'pull_request' || steps.pr_size.outputs.skip_review != 'true'
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           trigger_phrase: ${{ inputs.trigger_phrase }}
 
-          # Event-specific prompt:
-          # - pull_request: Full review with diff instructions
-          # - issue_comment: Read user's comment and respond (with PR number so Claude
-          #   doesn't have to guess). Without this, the action sends NO user message
-          #   in agent mode, causing intermittent "silent drops" where Claude just
-          #   outputs a generic greeting and exits.
+          # Only provide a prompt for pull_request events (auto-review).
+          # For issue_comment events (@claude mentions), the action handles
+          # routing natively — no custom prompt needed.
           prompt: |
             ${{ github.event_name == 'pull_request' && format('
-            REPO: {1}
-            PR NUMBER: {2}
+            Review this PR. Focus on {0}.
+            Only flag issues introduced by the changes, not pre-existing code.
+            If the changes look correct, say so briefly.
+            ', inputs.review_focus) || '' }}
 
-            Review this pull request.
-
-            START by running: git diff origin/{0}...HEAD --name-status
-            Then examine the changed lines using: git diff origin/{0}...HEAD
-
-            IMPORTANT: You MUST post your review as a GitHub PR comment using:
-            gh pr comment {2} --body "YOUR_REVIEW_HERE"
-
-            Do NOT just output text - you must use the gh command to post your review to the PR.
-            ', github.base_ref, github.repository, github.event.pull_request.number) || '' }}
-            ${{ github.event_name == 'issue_comment' && format('
-            REPO: {0}
-            PR NUMBER: {1}
-
-            A user has commented on this PR requesting your assistance.
-
-            START by reading their comment: gh pr view {1} --comments --json comments --jq ".comments[-1].body"
-            Then check the PR diff: git diff origin/main...HEAD
-
-            If they are asking for a review or check, perform a full code review of the changes.
-
-            IMPORTANT: You MUST post your response as a GitHub PR comment using:
-            gh pr comment {1} --body "YOUR_RESPONSE_HERE"
-
-            Do NOT just output text - you must use the gh command to post your response to the PR.
-            ', github.repository, github.event.issue.number) || '' }}
-
-          # CLI arguments (v1 format)
-          # --append-system-prompt provides base Alliance instructions for ALL event types
           claude_args: |
             --model ${{ inputs.model || vars.CLAUDE_PR_REVIEW_MODEL }}
             --max-turns ${{ inputs.max_turns }}
-            --allowedTools "Bash,Edit,Read,Write,Glob,Grep,LS"
-            --append-system-prompt "You are assisting with an Alliance of Genome Resources application.
-
-            REPOSITORY: ${{ github.repository }}
-            REVIEW FOCUS: ${{ inputs.review_focus }}
-
-            REVIEW APPROACH:
-            1. For code reviews, use git diff to understand what lines changed
-            2. For changed functions/methods, read the surrounding context to understand integration
-            3. Focus comments on CHANGES, not pre-existing code
-            4. Only flag issues INTRODUCED or WORSENED by the changes
-
-            WHEN TO READ BROADER CONTEXT:
-            - When a function signature changes (check callers)
-            - When a method implementation changes (understand the full method)
-            - When new code is added (verify it fits with surrounding code)
-            - When imports/dependencies change (check usage)
-
-            REVIEW SCOPE - Only flag issues that are:
-            1. Critical bugs that could cause data corruption or system failures
-            2. Database performance issues
-            3. Breaking changes to existing functionality
-
-            IMPORTANT: Many PRs are small fixes. If the changes look correct, simply say Changes look good.
-
-            Keep reviews concise and actionable. Reference specific line numbers from the diff.
-
-            CRITICAL: You MUST post your review to the PR using gh pr comment. Do not just output text.
-
-            IMPORTANT: Always end your responses with developer usage instructions:
-
-            ---
-            Claude Code Capabilities
-
-            I can help with additional commands! Try these:
-            - Answer Questions: ${{ inputs.trigger_phrase }} explain how the caching system works
-            - Implement Code Changes: ${{ inputs.trigger_phrase }} add error handling to the user login method
-            - Debug Issues: ${{ inputs.trigger_phrase }} help debug why the search is slow
-            - Analyze Architecture: ${{ inputs.trigger_phrase }} review the database schema changes
-            - Perform another review: ${{ inputs.trigger_phrase }} Please review my changes
-
-            Just comment ${{ inputs.trigger_phrase }} followed by your request!"
-
-          # Environment variables via settings (v1 format - replaces claude_env)
-          settings: |
-            {
-              "env": {
-                "REPOSITORY": "${{ github.repository }}",
-                "ORGANIZATION": "${{ github.repository_owner }}",
-                "REVIEW_FOCUS": "${{ inputs.review_focus }}",
-                "PR_SIZE": "${{ github.event_name == 'pull_request' && steps.pr_size.outputs.total_changes || 'N/A' }}",
-                "REVIEW_SKIPPED": "${{ github.event_name == 'pull_request' && steps.pr_size.outputs.skip_review || 'false' }}"
-              }
-            }
-
-      - name: Upload transcript (Attempt 1)
-        if: always() && steps.claude_review.outcome != 'skipped'
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: claude-execution-${{ github.run_id }}-attempt-1
-          path: ${{ steps.claude_review.outputs.execution_file }}
-          retention-days: 7
-          if-no-files-found: warn
-
-      - name: Verify attempt 1
-        id: verify_1
-        if: always() && steps.claude_review.outcome != 'skipped'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const issueNumber = parseInt('${{ steps.pre_check.outputs.issue_number }}');
-            if (!issueNumber) {
-              console.log('No issue/PR number — skipping verification');
-              core.setOutput('needs_retry', 'false');
-              return;
-            }
-
-            const baselineCount = parseInt('${{ steps.pre_check.outputs.baseline_count }}');
-            const maxRetries = parseInt('${{ inputs.max_retries }}') || 1;
-
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issueNumber,
-              per_page: 100
-            });
-            const currentCount = comments.filter(c => c.user.login === 'claude[bot]').length;
-            const posted = currentCount > baselineCount;
-
-            console.log(`Attempt 1: baseline=${baselineCount}, current=${currentCount}, posted=${posted}, maxRetries=${maxRetries}`);
-
-            if (posted) {
-              console.log('Review comment posted on attempt 1 — no retry needed');
-              core.setOutput('needs_retry', 'false');
-            } else if (maxRetries < 1) {
-              console.log('Silent drop detected but retries disabled (max_retries=0)');
-              core.setOutput('needs_retry', 'false');
-            } else {
-              console.log('Silent drop detected — will retry');
-              core.setOutput('needs_retry', 'true');
-            }
-
-      # ================================================================
-      # RETRY (Attempt 2) — only runs if attempt 1 didn't post a comment
-      # ================================================================
-      - name: Claude Code Review (Retry)
-        id: claude_retry
-        continue-on-error: true
-        uses: anthropics/claude-code-action@v1
-        if: always() && steps.verify_1.outputs.needs_retry == 'true'
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          trigger_phrase: ${{ inputs.trigger_phrase }}
-          prompt: |
-            ${{ github.event_name == 'pull_request' && format('
-            REPO: {1}
-            PR NUMBER: {2}
-
-            Review this pull request.
-
-            START by running: git diff origin/{0}...HEAD --name-status
-            Then examine the changed lines using: git diff origin/{0}...HEAD
-
-            IMPORTANT: You MUST post your review as a GitHub PR comment using:
-            gh pr comment {2} --body "YOUR_REVIEW_HERE"
-
-            Do NOT just output text - you must use the gh command to post your review to the PR.
-            ', github.base_ref, github.repository, github.event.pull_request.number) || '' }}
-            ${{ github.event_name == 'issue_comment' && format('
-            REPO: {0}
-            PR NUMBER: {1}
-
-            A user has commented on this PR requesting your assistance.
-
-            START by reading their comment: gh pr view {1} --comments --json comments --jq ".comments[-1].body"
-            Then check the PR diff: git diff origin/main...HEAD
-
-            If they are asking for a review or check, perform a full code review of the changes.
-
-            IMPORTANT: You MUST post your response as a GitHub PR comment using:
-            gh pr comment {1} --body "YOUR_RESPONSE_HERE"
-
-            Do NOT just output text - you must use the gh command to post your response to the PR.
-            ', github.repository, github.event.issue.number) || '' }}
-          claude_args: |
-            --model ${{ inputs.model || vars.CLAUDE_PR_REVIEW_MODEL }}
-            --max-turns ${{ inputs.max_turns }}
-            --allowedTools "Bash,Edit,Read,Write,Glob,Grep,LS"
-            --append-system-prompt "You are assisting with an Alliance of Genome Resources application.
-
-            REPOSITORY: ${{ github.repository }}
-            REVIEW FOCUS: ${{ inputs.review_focus }}
-
-            REVIEW APPROACH:
-            1. For code reviews, use git diff to understand what lines changed
-            2. For changed functions/methods, read the surrounding context to understand integration
-            3. Focus comments on CHANGES, not pre-existing code
-            4. Only flag issues INTRODUCED or WORSENED by the changes
-
-            WHEN TO READ BROADER CONTEXT:
-            - When a function signature changes (check callers)
-            - When a method implementation changes (understand the full method)
-            - When new code is added (verify it fits with surrounding code)
-            - When imports/dependencies change (check usage)
-
-            REVIEW SCOPE - Only flag issues that are:
-            1. Critical bugs that could cause data corruption or system failures
-            2. Database performance issues
-            3. Breaking changes to existing functionality
-
-            IMPORTANT: Many PRs are small fixes. If the changes look correct, simply say Changes look good.
-
-            Keep reviews concise and actionable. Reference specific line numbers from the diff.
-
-            CRITICAL: You MUST post your review to the PR using gh pr comment. Do not just output text.
-
-            IMPORTANT: Always end your responses with developer usage instructions:
-
-            ---
-            Claude Code Capabilities
-
-            I can help with additional commands! Try these:
-            - Answer Questions: ${{ inputs.trigger_phrase }} explain how the caching system works
-            - Implement Code Changes: ${{ inputs.trigger_phrase }} add error handling to the user login method
-            - Debug Issues: ${{ inputs.trigger_phrase }} help debug why the search is slow
-            - Analyze Architecture: ${{ inputs.trigger_phrase }} review the database schema changes
-            - Perform another review: ${{ inputs.trigger_phrase }} Please review my changes
-
-            Just comment ${{ inputs.trigger_phrase }} followed by your request!"
-          settings: |
-            {
-              "env": {
-                "REPOSITORY": "${{ github.repository }}",
-                "ORGANIZATION": "${{ github.repository_owner }}",
-                "REVIEW_FOCUS": "${{ inputs.review_focus }}",
-                "PR_SIZE": "${{ github.event_name == 'pull_request' && steps.pr_size.outputs.total_changes || 'N/A' }}",
-                "REVIEW_SKIPPED": "${{ github.event_name == 'pull_request' && steps.pr_size.outputs.skip_review || 'false' }}"
-              }
-            }
-
-      - name: Upload transcript (Retry)
-        if: always() && steps.claude_retry.outcome != 'skipped'
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: claude-execution-${{ github.run_id }}-attempt-2
-          path: ${{ steps.claude_retry.outputs.execution_file }}
-          retention-days: 7
-          if-no-files-found: warn
-
-      # ================================================================
-      # DIAGNOSTICS & FINAL VERIFICATION
-      # ================================================================
-      - name: Log execution diagnostics
-        if: always() && steps.claude_review.outcome != 'skipped'
-        shell: bash
-        run: |
-          # Report on the last attempt that actually ran
-          if [ "${{ steps.claude_retry.outcome }}" != "skipped" ] && [ -n "${{ steps.claude_retry.outcome }}" ]; then
-            ATTEMPT="2 (retry)"
-            OUTCOME="${{ steps.claude_retry.outcome }}"
-            EXEC_FILE="${{ steps.claude_retry.outputs.execution_file }}"
-            SESSION_ID="${{ steps.claude_retry.outputs.session_id }}"
-          else
-            ATTEMPT="1"
-            OUTCOME="${{ steps.claude_review.outcome }}"
-            EXEC_FILE="${{ steps.claude_review.outputs.execution_file }}"
-            SESSION_ID="${{ steps.claude_review.outputs.session_id }}"
-          fi
-
-          echo "=== Claude Code Review Diagnostics ==="
-          echo "Last attempt: $ATTEMPT"
-          echo "Step outcome: $OUTCOME"
-          echo "Session ID: $SESSION_ID"
-          echo "Retry triggered: ${{ steps.verify_1.outputs.needs_retry }}"
-
-          if [ -n "$EXEC_FILE" ] && [ -f "$EXEC_FILE" ]; then
-            echo ""
-            echo "=== Result Message (from execution file) ==="
-            jq '.[-1] | {type, subtype, is_error, num_turns, duration_ms, duration_api_ms, total_cost_usd}' "$EXEC_FILE" 2>/dev/null || echo "Could not parse result message"
-
-            echo ""
-            echo "=== Tool Usage Summary ==="
-            jq '[.[] | select(.type == "assistant") | .message.content[]? | select(.type == "tool_use") | .name] | group_by(.) | map({tool: .[0], count: length}) | sort_by(-.count)' "$EXEC_FILE" 2>/dev/null || echo "Could not parse tool usage"
-
-            echo ""
-            echo "=== Claude Result Text (first 500 chars) ==="
-            jq -r '.[-1].result // "No result text found" | .[0:500]' "$EXEC_FILE" 2>/dev/null || echo "Could not extract result text"
-          else
-            echo ""
-            echo "WARNING: No execution file found at: $EXEC_FILE"
-            echo "This may indicate the step was cancelled or Claude failed to start."
-          fi
-
-      - name: Final verification and notification
-        if: always() && steps.claude_review.outcome != 'skipped'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const issueNumber = parseInt('${{ steps.pre_check.outputs.issue_number }}');
-            if (!issueNumber) {
-              console.log('No issue/PR number found — skipping final verification');
-              return;
-            }
-
-            // If attempt 1 succeeded, we're done
-            if ('${{ steps.verify_1.outputs.needs_retry }}' !== 'true') {
-              console.log('Attempt 1 posted successfully — nothing to do');
-              return;
-            }
-
-            // A retry was needed. Check if the retry posted a comment.
-            const baselineCount = parseInt('${{ steps.pre_check.outputs.baseline_count }}');
-            const retryOutcome = '${{ steps.claude_retry.outcome }}';
-            const notifyUsers = '${{ inputs.notify_on_failure }}'.split(',').map(u => u.trim()).filter(Boolean);
-            const mentionStr = notifyUsers.length > 0 ? '\n\ncc ' + notifyUsers.map(u => `@${u}`).join(' ') : '';
-            const triggerPhrase = '${{ inputs.trigger_phrase }}';
-
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issueNumber,
-              per_page: 100
-            });
-            const currentCount = comments.filter(c => c.user.login === 'claude[bot]').length;
-
-            console.log(`Final verify: baseline=${baselineCount}, current=${currentCount}, retryOutcome=${retryOutcome}`);
-
-            if (currentCount > baselineCount) {
-              console.log('Review comment posted on retry — success');
-              return;
-            }
-
-            // --- All attempts failed to post a comment ---
-            const attempt1Outcome = '${{ steps.claude_review.outcome }}';
-            const wasTimeout = attempt1Outcome === 'cancelled' || retryOutcome === 'cancelled';
-
-            if (wasTimeout) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issueNumber,
-                body: [
-                  '**Claude Code Review — Timed Out**',
-                  '',
-                  'The review exceeded the timeout after multiple attempts.',
-                  '',
-                  `**To retry**, comment: \`${triggerPhrase} please review my changes\``,
-                  '',
-                  `[View run logs](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) | [Download transcript](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}#artifacts)`,
-                  '',
-                  '---',
-                  `*Automated notification from the Claude Code Review workflow.*${mentionStr}`
-                ].join('\n')
-              });
-              core.setFailed('Claude Code Review timed out after retry');
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issueNumber,
-                body: [
-                  '**Claude Code Review — Review Not Posted**',
-                  '',
-                  'Claude completed but did not post a review comment after 2 attempts.',
-                  '',
-                  `**To retry**, comment: \`${triggerPhrase} please review my changes\``,
-                  '',
-                  `[View run logs](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) | [Download transcript](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}#artifacts)`,
-                  '',
-                  '---',
-                  `*Automated notification from the Claude Code Review workflow.*${mentionStr}`
-                ].join('\n')
-              });
-              core.setFailed('Claude Code Review silent drop — all retries exhausted');
-            }
