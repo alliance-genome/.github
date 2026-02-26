@@ -31,9 +31,9 @@ on:
         default: '3'
         type: string
       max_retries:
-        description: 'Maximum auto-retry attempts when Claude completes but does not post a comment'
+        description: 'Maximum auto-retry attempts when Claude completes but does not post a comment (0=disable, max 3)'
         required: false
-        default: '3'
+        default: '1'
         type: string
       notify_on_failure:
         description: 'GitHub usernames to mention on review failures/retries (comma-separated, without @)'
@@ -48,7 +48,7 @@ on:
 jobs:
   claude-review:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 25
     permissions:
       contents: read
       pull-requests: write
@@ -172,8 +172,12 @@ jobs:
             core.setOutput('issue_number', String(issueNumber));
             console.log(`Baseline: ${botComments.length} claude[bot] comments on #${issueNumber}`);
 
-      - name: Claude Code Review
+      # ================================================================
+      # ATTEMPT 1
+      # ================================================================
+      - name: Claude Code Review (Attempt 1)
         id: claude_review
+        continue-on-error: true
         uses: anthropics/claude-code-action@v1
         if: github.event_name != 'pull_request' || steps.pr_size.outputs.skip_review != 'true'
         with:
@@ -278,26 +282,193 @@ jobs:
               }
             }
 
+      - name: Upload transcript (Attempt 1)
+        if: always() && steps.claude_review.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-execution-${{ github.run_id }}-attempt-1
+          path: ${{ steps.claude_review.outputs.execution_file }}
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Verify attempt 1
+        id: verify_1
+        if: always() && steps.claude_review.outcome != 'skipped'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = parseInt('${{ steps.pre_check.outputs.issue_number }}');
+            if (!issueNumber) {
+              console.log('No issue/PR number — skipping verification');
+              core.setOutput('needs_retry', 'false');
+              return;
+            }
+
+            const baselineCount = parseInt('${{ steps.pre_check.outputs.baseline_count }}');
+            const maxRetries = parseInt('${{ inputs.max_retries }}') || 1;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              per_page: 100
+            });
+            const currentCount = comments.filter(c => c.user.login === 'claude[bot]').length;
+            const posted = currentCount > baselineCount;
+
+            console.log(`Attempt 1: baseline=${baselineCount}, current=${currentCount}, posted=${posted}, maxRetries=${maxRetries}`);
+
+            if (posted) {
+              console.log('Review comment posted on attempt 1 — no retry needed');
+              core.setOutput('needs_retry', 'false');
+            } else if (maxRetries < 1) {
+              console.log('Silent drop detected but retries disabled (max_retries=0)');
+              core.setOutput('needs_retry', 'false');
+            } else {
+              console.log('Silent drop detected — will retry');
+              core.setOutput('needs_retry', 'true');
+            }
+
+      # ================================================================
+      # RETRY (Attempt 2) — only runs if attempt 1 didn't post a comment
+      # ================================================================
+      - name: Claude Code Review (Retry)
+        id: claude_retry
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        if: steps.verify_1.outputs.needs_retry == 'true'
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          trigger_phrase: ${{ inputs.trigger_phrase }}
+          prompt: |
+            ${{ github.event_name == 'pull_request' && format('
+            REPO: {1}
+            PR NUMBER: {2}
+
+            Review this pull request.
+
+            START by running: git diff origin/{0}...HEAD --name-status
+            Then examine the changed lines using: git diff origin/{0}...HEAD
+
+            IMPORTANT: You MUST post your review as a GitHub PR comment using:
+            gh pr comment {2} --body "YOUR_REVIEW_HERE"
+
+            Do NOT just output text - you must use the gh command to post your review to the PR.
+            ', github.base_ref, github.repository, github.event.pull_request.number) || '' }}
+            ${{ github.event_name == 'issue_comment' && format('
+            REPO: {0}
+            PR NUMBER: {1}
+
+            A user has commented on this PR requesting your assistance.
+
+            START by reading their comment: gh pr view {1} --comments --json comments --jq ".comments[-1].body"
+            Then check the PR diff: git diff origin/main...HEAD
+
+            If they are asking for a review or check, perform a full code review of the changes.
+
+            IMPORTANT: You MUST post your response as a GitHub PR comment using:
+            gh pr comment {1} --body "YOUR_RESPONSE_HERE"
+
+            Do NOT just output text - you must use the gh command to post your response to the PR.
+            ', github.repository, github.event.issue.number) || '' }}
+          claude_args: |
+            --model ${{ inputs.model || vars.CLAUDE_PR_REVIEW_MODEL }}
+            --max-turns ${{ inputs.max_turns }}
+            --allowedTools "Bash,Edit,Read,Write,Glob,Grep,LS"
+            --append-system-prompt "You are assisting with an Alliance of Genome Resources application.
+
+            REPOSITORY: ${{ github.repository }}
+            REVIEW FOCUS: ${{ inputs.review_focus }}
+
+            REVIEW APPROACH:
+            1. For code reviews, use git diff to understand what lines changed
+            2. For changed functions/methods, read the surrounding context to understand integration
+            3. Focus comments on CHANGES, not pre-existing code
+            4. Only flag issues INTRODUCED or WORSENED by the changes
+
+            WHEN TO READ BROADER CONTEXT:
+            - When a function signature changes (check callers)
+            - When a method implementation changes (understand the full method)
+            - When new code is added (verify it fits with surrounding code)
+            - When imports/dependencies change (check usage)
+
+            REVIEW SCOPE - Only flag issues that are:
+            1. Critical bugs that could cause data corruption or system failures
+            2. Database performance issues
+            3. Breaking changes to existing functionality
+
+            IMPORTANT: Many PRs are small fixes. If the changes look correct, simply say Changes look good.
+
+            Keep reviews concise and actionable. Reference specific line numbers from the diff.
+
+            CRITICAL: You MUST post your review to the PR using gh pr comment. Do not just output text.
+
+            IMPORTANT: Always end your responses with developer usage instructions:
+
+            ---
+            Claude Code Capabilities
+
+            I can help with additional commands! Try these:
+            - Answer Questions: ${{ inputs.trigger_phrase }} explain how the caching system works
+            - Implement Code Changes: ${{ inputs.trigger_phrase }} add error handling to the user login method
+            - Debug Issues: ${{ inputs.trigger_phrase }} help debug why the search is slow
+            - Analyze Architecture: ${{ inputs.trigger_phrase }} review the database schema changes
+            - Perform another review: ${{ inputs.trigger_phrase }} Please review my changes
+
+            Just comment ${{ inputs.trigger_phrase }} followed by your request!"
+          settings: |
+            {
+              "env": {
+                "REPOSITORY": "${{ github.repository }}",
+                "ORGANIZATION": "${{ github.repository_owner }}",
+                "REVIEW_FOCUS": "${{ inputs.review_focus }}",
+                "PR_SIZE": "${{ github.event_name == 'pull_request' && steps.pr_size.outputs.total_changes || 'N/A' }}",
+                "REVIEW_SKIPPED": "${{ github.event_name == 'pull_request' && steps.pr_size.outputs.skip_review || 'false' }}"
+              }
+            }
+
+      - name: Upload transcript (Retry)
+        if: always() && steps.claude_retry.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-execution-${{ github.run_id }}-attempt-2
+          path: ${{ steps.claude_retry.outputs.execution_file }}
+          retention-days: 7
+          if-no-files-found: warn
+
+      # ================================================================
+      # DIAGNOSTICS & FINAL VERIFICATION
+      # ================================================================
       - name: Log execution diagnostics
         if: always() && steps.claude_review.outcome != 'skipped'
         shell: bash
         run: |
-          echo "=== Claude Code Review Diagnostics ==="
-          echo "Step outcome: ${{ steps.claude_review.outcome }}"
-          echo "Conclusion output: ${{ steps.claude_review.outputs.conclusion }}"
-          echo "Session ID: ${{ steps.claude_review.outputs.session_id }}"
+          # Report on the last attempt that actually ran
+          if [ "${{ steps.claude_retry.outcome }}" != "skipped" ] && [ -n "${{ steps.claude_retry.outcome }}" ]; then
+            ATTEMPT="2 (retry)"
+            OUTCOME="${{ steps.claude_retry.outcome }}"
+            EXEC_FILE="${{ steps.claude_retry.outputs.execution_file }}"
+            SESSION_ID="${{ steps.claude_retry.outputs.session_id }}"
+          else
+            ATTEMPT="1"
+            OUTCOME="${{ steps.claude_review.outcome }}"
+            EXEC_FILE="${{ steps.claude_review.outputs.execution_file }}"
+            SESSION_ID="${{ steps.claude_review.outputs.session_id }}"
+          fi
 
-          EXEC_FILE="${{ steps.claude_review.outputs.execution_file }}"
+          echo "=== Claude Code Review Diagnostics ==="
+          echo "Last attempt: $ATTEMPT"
+          echo "Step outcome: $OUTCOME"
+          echo "Session ID: $SESSION_ID"
+          echo "Retry triggered: ${{ steps.verify_1.outputs.needs_retry }}"
+
           if [ -n "$EXEC_FILE" ] && [ -f "$EXEC_FILE" ]; then
             echo ""
             echo "=== Result Message (from execution file) ==="
-            # The execution file is a JSON array of SDK messages.
-            # The last element is the 'result' message containing metrics.
             jq '.[-1] | {type, subtype, is_error, num_turns, duration_ms, duration_api_ms, total_cost_usd}' "$EXEC_FILE" 2>/dev/null || echo "Could not parse result message"
 
             echo ""
             echo "=== Tool Usage Summary ==="
-            # Count tool calls by name to see what Claude actually did
             jq '[.[] | select(.type == "assistant") | .message.content[]? | select(.type == "tool_use") | .name] | group_by(.) | map({tool: .[0], count: length}) | sort_by(-.count)' "$EXEC_FILE" 2>/dev/null || echo "Could not parse tool usage"
 
             echo ""
@@ -309,56 +480,50 @@ jobs:
             echo "This may indicate the step was cancelled or Claude failed to start."
           fi
 
-      - name: Upload execution transcript
-        if: always() && steps.claude_review.outcome != 'skipped'
-        uses: actions/upload-artifact@v4
-        with:
-          name: claude-execution-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ steps.claude_review.outputs.execution_file }}
-          retention-days: 7
-          if-no-files-found: warn
-
-      - name: Verify review and auto-retry on silent drop
+      - name: Final verification and notification
         if: always() && steps.claude_review.outcome != 'skipped'
         uses: actions/github-script@v7
         with:
           script: |
             const issueNumber = parseInt('${{ steps.pre_check.outputs.issue_number }}');
             if (!issueNumber) {
-              console.log('No issue/PR number found — skipping verification');
+              console.log('No issue/PR number found — skipping final verification');
               return;
             }
 
+            // If attempt 1 succeeded, we're done
+            if ('${{ steps.verify_1.outputs.needs_retry }}' !== 'true') {
+              console.log('Attempt 1 posted successfully — nothing to do');
+              return;
+            }
+
+            // A retry was needed. Check if the retry posted a comment.
             const baselineCount = parseInt('${{ steps.pre_check.outputs.baseline_count }}');
-            const reviewOutcome = '${{ steps.claude_review.outcome }}';
+            const retryOutcome = '${{ steps.claude_retry.outcome }}';
             const notifyUsers = '${{ inputs.notify_on_failure }}'.split(',').map(u => u.trim()).filter(Boolean);
             const mentionStr = notifyUsers.length > 0 ? '\n\ncc ' + notifyUsers.map(u => `@${u}`).join(' ') : '';
             const triggerPhrase = '${{ inputs.trigger_phrase }}';
 
-            // Count current claude[bot] comments
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: issueNumber,
               per_page: 100
             });
-            const currentBotComments = comments.filter(c => c.user.login === 'claude[bot]');
+            const currentCount = comments.filter(c => c.user.login === 'claude[bot]').length;
 
-            console.log(`Baseline: ${baselineCount}, Current: ${currentBotComments.length}, Review outcome: ${reviewOutcome}`);
+            console.log(`Final verify: baseline=${baselineCount}, current=${currentCount}, retryOutcome=${retryOutcome}`);
 
-            if (currentBotComments.length > baselineCount) {
-              console.log('Review comment was posted successfully');
+            if (currentCount > baselineCount) {
+              console.log('Review comment posted on retry — success');
               return;
             }
 
-            // --- No new comment was posted (silent drop or timeout) ---
-            // Automatic retry is not possible from within the same workflow run:
-            // - gh run rerun fails with "This workflow is already running"
-            // - GITHUB_TOKEN comments don't trigger new workflow runs (anti-loop)
-            // So we post a notification with retry instructions for the user.
+            // --- All attempts failed to post a comment ---
+            const attempt1Outcome = '${{ steps.claude_review.outcome }}';
+            const wasTimeout = attempt1Outcome === 'cancelled' || retryOutcome === 'cancelled';
 
-            if (reviewOutcome === 'cancelled') {
-              // Timeout — likely too complex, would timeout again
+            if (wasTimeout) {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -366,7 +531,7 @@ jobs:
                 body: [
                   '**Claude Code Review — Timed Out**',
                   '',
-                  'The review exceeded the 8-minute timeout.',
+                  'The review exceeded the timeout after multiple attempts.',
                   '',
                   `**To retry**, comment: \`${triggerPhrase} please review my changes\``,
                   '',
@@ -376,9 +541,8 @@ jobs:
                   `*Automated notification from the Claude Code Review workflow.*${mentionStr}`
                 ].join('\n')
               });
-              core.setFailed('Claude Code Review timed out');
+              core.setFailed('Claude Code Review timed out after retry');
             } else {
-              // Silent drop — Claude completed but didn't post a comment
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -386,7 +550,7 @@ jobs:
                 body: [
                   '**Claude Code Review — Review Not Posted**',
                   '',
-                  'Claude completed but did not post a review comment (known intermittent issue).',
+                  'Claude completed but did not post a review comment after 2 attempts.',
                   '',
                   `**To retry**, comment: \`${triggerPhrase} please review my changes\``,
                   '',
@@ -396,5 +560,5 @@ jobs:
                   `*Automated notification from the Claude Code Review workflow.*${mentionStr}`
                 ].join('\n')
               });
-              core.setFailed('Claude Code Review silent drop — notification posted');
+              core.setFailed('Claude Code Review silent drop — all retries exhausted');
             }
