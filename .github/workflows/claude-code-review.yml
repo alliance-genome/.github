@@ -11,7 +11,12 @@ on:
       max_turns:
         description: 'Maximum conversation turns'
         required: false
-        default: '60'
+        default: '15'
+        type: string
+      max_budget_usd:
+        description: 'Maximum cost per review in USD (0=no limit)'
+        required: false
+        default: '3.00'
         type: string
       review_focus:
         description: 'What to focus the review on'
@@ -96,9 +101,26 @@ jobs:
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
 
-            Review this PR. Focus on ${{ inputs.review_focus }}.
-            Only flag issues introduced by the changes, not pre-existing code.
-            If the changes look correct, say so briefly.
+            START by running: gh pr diff ${{ github.event.pull_request.number }} --name-only
+            Examine what types of files changed (code, config, docs, tests, etc.).
+            Then read the full diff: gh pr diff ${{ github.event.pull_request.number }}
+
+            Scope your review to the types of files that actually changed.
+            Do NOT apply a generic checklist — tailor your analysis to the diff.
+
+            If the repo contains a CLAUDE.md file, read it first for project context.
+            If the repo contains a REVIEW.md file, follow its review guidelines.
+
+            Focus on:
+            - Correctness and logic errors in the changed code
+            - ${{ inputs.review_focus }}
+            - Breaking changes to public APIs or interfaces
+
+            Rules:
+            - Only flag issues introduced by the changes, not pre-existing code.
+            - If the changes look correct, say so briefly. Do NOT invent issues.
+            - Do NOT pad reviews with trivial suggestions or stylistic preferences.
+            - Focus on bugs that would break production.
 
             Use `gh pr comment` for top-level feedback.
             Only post GitHub comments — do not submit review text as messages.
@@ -106,6 +128,7 @@ jobs:
           claude_args: |
             --model ${{ inputs.model || vars.CLAUDE_PR_REVIEW_MODEL }}
             --max-turns ${{ inputs.max_turns }}
+            --max-budget-usd ${{ inputs.max_budget_usd }}
             --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Read,Glob,Grep"
 
       # Interactive mode: respond to @claude mentions on PRs.
@@ -119,4 +142,5 @@ jobs:
           claude_args: |
             --model ${{ inputs.model || vars.CLAUDE_PR_REVIEW_MODEL }}
             --max-turns ${{ inputs.max_turns }}
+            --max-budget-usd ${{ inputs.max_budget_usd }}
             --append-system-prompt "When re-reviewing a PR after being asked to check again, ALWAYS run git log --oneline to check if new commits were pushed since your previous review. Read through all PR comments to find your earlier review(s) and note when they were posted. If new commits were pushed after your previous review, check whether those commits addressed the feedback from your earlier review. Frame your updated review accordingly — for example, note which issues from your earlier review have been addressed by the new commit(s) and which (if any) remain. Do NOT retract or call previous reviews inaccurate when subsequent commits fixed the issues that were flagged."
