@@ -94,6 +94,19 @@ jobs:
               body: `**Claude Code Review Skipped** — only **${{ steps.pr_size.outputs.total_changes }}** lines changed (<= ${{ inputs.skip_threshold }}). Comment \`${{ inputs.trigger_phrase }} review my changes\` to request one.`
             })
 
+      # Install Claude Code ourselves instead of using the version bundled with the
+      # action, which can lag behind new models (e.g. claude-opus-5-5 needs >= 2.1.280).
+      # CLAUDE_CODE_VERSION org/repo variable: latest | stable | exact version (e.g. 2.1.280).
+      # To roll back a bad Claude Code release, set it to the last known-good version.
+      - name: Install Claude Code
+        id: claude_install
+        if: github.event_name == 'issue_comment' || steps.pr_size.outputs.skip_review != 'true'
+        run: |
+          set -eo pipefail
+          curl -fsSL https://claude.ai/install.sh | bash -s -- "${{ vars.CLAUDE_CODE_VERSION || 'latest' }}"
+          "$HOME/.local/bin/claude" --version
+          echo "path=$HOME/.local/bin/claude" >> "$GITHUB_OUTPUT"
+
       # Automation mode: auto-review on pull_request events.
       # Per official docs: provide REPO, PR NUMBER, gh pr comment instruction, and --allowedTools.
       - name: Claude Code Review (auto-review)
@@ -101,6 +114,7 @@ jobs:
         if: github.event_name == 'pull_request' && steps.pr_size.outputs.skip_review != 'true'
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          path_to_claude_code_executable: ${{ steps.claude_install.outputs.path }}
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
@@ -165,6 +179,7 @@ jobs:
         if: github.event_name == 'issue_comment'
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          path_to_claude_code_executable: ${{ steps.claude_install.outputs.path }}
           trigger_phrase: ${{ inputs.trigger_phrase }}
           # See the permission strategy comment on the auto-review step above.
           # Same blocklist applies to @claude interactive mentions.
